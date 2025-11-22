@@ -11,6 +11,30 @@ RID="${RID:-0}"             # id del robot (0 por defecto)
 info(){ printf "\033[1m[INFO]\033[0m %s\n" "$*"; }
 err(){  printf "\033[31m[ERROR]\033[0m %s\n" "$*" 1>&2; }
 
+# Comprueba si un JSON contiene scalars problemáticos ("NaN", null o cadena vacía)
+check_bad_response(){
+  local json="$1"
+  local bad
+  bad=$(jq -r '([.. | scalars] | map(tostring) | map(select(.=="NaN" or .=="null" or .=="")) | length)'
+         <<<"$json" 2>/dev/null || echo 0)
+  if [ "${bad:-0}" -gt 0 ]; then
+    return 1
+  fi
+  return 0
+}
+
+# Extrae un campo con jq y sustituye valores no numéricos por un valor por defecto
+safe_jq(){
+  local json="$1"; local expr="$2"; local def="${3:-0}"
+  local out
+  out=$(jq -r "${expr}" <<<"$json" 2>/dev/null || echo "${def}")
+  if [ "${out}" = "NaN" ] || [ "${out}" = "null" ] || [ -z "${out}" ]; then
+    echo "${def}"
+  else
+    echo "${out}"
+  fi
+}
+
 post_nobody(){ # POST sin body JSON
   curl -fsS -X POST "http://${HOST}:${PORT}$1"
 }
@@ -35,9 +59,14 @@ post_json "/torque/toggle?robot_id=${RID}" '{"torque_status": false}' | jq -r '.
 # 2) Lanzar calibración y hacer polling hasta terminar
 info "Iniciando calibración… (sujeta el brazo: el torque está OFF)"
 resp="$(post_nobody "/calibrate?robot_id=${RID}")"
-status="$(jq -r '.calibration_status' <<<"$resp")"
-total="$(jq -r '.total_nb_steps // 0' <<<"$resp")"
-step="$(jq -r '.current_step // 0' <<<"$resp")"
+if ! check_bad_response "$resp"; then
+  err "Respuesta con valores no numéricos durante calibración. Aborting."
+  err "$resp"
+  exit 1
+fi
+status="$(jq -r '.calibration_status // "error"' <<<"$resp")"
+total="$(safe_jq "$resp" '.total_nb_steps // 0' 0)"
+step="$(safe_jq "$resp" '.current_step // 0' 0)"
 msg="$(jq -r '.message // ""' <<<"$resp")"
 printf "  -> %s (%s/%s): %s\n" "$status" "$step" "$total" "$msg"
 
@@ -45,8 +74,13 @@ printf "  -> %s (%s/%s): %s\n" "$status" "$step" "$total" "$msg"
 while [ "$status" = "in_progress" ]; do
   sleep 2
   resp="$(post_nobody "/calibrate?robot_id=${RID}")"
-  status="$(jq -r '.calibration_status' <<<"$resp")"
-  step="$(jq -r '.current_step // 0' <<<"$resp")"
+  if ! check_bad_response "$resp"; then
+    err "Respuesta con valores no numéricos durante calibración (polling). Aborting."
+    err "$resp"
+    exit 1
+  fi
+  status="$(jq -r '.calibration_status // "error"' <<<"$resp")"
+  step="$(safe_jq "$resp" '.current_step // 0' 0)"
   msg="$(jq -r '.message // ""' <<<"$resp")"
   printf "  -> %s (%s/%s): %s\n" "$status" "$step" "$total" "$msg"
 done
@@ -56,6 +90,16 @@ if [ "$status" != "success" ]; then
   exit 1
 fi
 info "Calibración COMPLETADA."
+
+# 3a) Verificar que los joints leídos desde hardware no contienen NaN/null
+info "Verificando joints leídos desde hardware (no debe contener NaN)…"
+joints_resp="$(post_json "/joints/read?robot_id=${RID}" '{"unit":"rad","source":"robot"}')"
+if ! check_bad_response "$joints_resp"; then
+  err "Lectura de joints contiene valores no válidos (NaN/null). No se activará torque."
+  err "$joints_resp"
+  exit 1
+fi
+info "Lectura de joints OK (sin NaN)."
 
 # Doc: /calibrate (status: in_progress|success|error)  [oai_citation:3‡docs.phospho.ai](https://docs.phospho.ai/control/calibration-sequence)
 
