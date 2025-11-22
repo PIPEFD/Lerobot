@@ -7,9 +7,46 @@ set -euo pipefail
 HOST="${HOST:-localhost}"   # o phosphobot.local
 PORT="${PORT:-80}"
 RID="${RID:-0}"             # id del robot (0 por defecto)
+SAVE_DIR="${SAVE_DIR:-/tmp}"
+FORCE="false"
+DRY_RUN="false"
+SIMULATE="false"
+POLL_INTERVAL="2"
 
 info(){ printf "\033[1m[INFO]\033[0m %s\n" "$*"; }
 err(){  printf "\033[31m[ERROR]\033[0m %s\n" "$*" 1>&2; }
+
+usage(){
+  cat <<EOF
+Usage: $(basename "$0") [options]
+Options:
+  --host HOST           API host (default: $HOST)
+  --port PORT           API port (default: $PORT)
+  --rid ID              Robot id (default: $RID)
+  --save-dir DIR        Directory to save failed JSON (default: $SAVE_DIR)
+  --force               Force continue even if JSON contains NaN/null
+  --dry-run             Do not perform HTTP requests (prints what would run)
+  --simulate            Use simulated responses for testing
+  --poll-interval SEC   Poll interval in seconds (default: $POLL_INTERVAL)
+  -h, --help            Show this help
+EOF
+  exit 0
+}
+
+log(){
+  # simple prefixed log for debug
+  printf "[CALIBRAR] %s\n" "$*"
+}
+
+save_bad_json(){
+  local json="$1"; local name="${2:-bad_response}"
+  mkdir -p "$SAVE_DIR" 2>/dev/null || true
+  local ts
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  local file="$SAVE_DIR/${name}_${ts}.json"
+  printf "%s\n" "$json" > "$file"
+  err "Saved bad JSON to: $file"
+}
 
 # Comprueba si un JSON contiene scalars problemáticos ("NaN", null o cadena vacía)
 check_bad_response(){
@@ -36,14 +73,64 @@ safe_jq(){
 }
 
 post_nobody(){ # POST sin body JSON
-  curl -fsS -X POST "http://${HOST}:${PORT}$1"
+  local endpoint="$1"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "DRY-RUN: POST http://${HOST}:${PORT}${endpoint}"
+    echo "{}"
+    return 0
+  fi
+  if [ "$SIMULATE" = "true" ]; then
+    # simple simulate: return minimal progress JSON for /calibrate
+    if [[ "$endpoint" == /calibrate* ]]; then
+      printf '{"calibration_status":"success","total_nb_steps":10,"current_step":10,"message":"simulated"}'
+      return 0
+    fi
+    if [[ "$endpoint" == /move/init* ]]; then
+      printf '{"status":"ok","message":"simulated init"}'
+      return 0
+    fi
+    echo "{}"
+    return 0
+  fi
+  curl -fsS -X POST "http://${HOST}:${PORT}${endpoint}"
 }
 
 post_json(){   # POST con body JSON
   local endpoint="$1"; local json="${2:-{}}"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "DRY-RUN: POST http://${HOST}:${PORT}${endpoint} -d '${json}'"
+    echo "{}"
+    return 0
+  fi
+  if [ "$SIMULATE" = "true" ]; then
+    if [[ "$endpoint" == /joints/read* ]]; then
+      printf '{"joints":[0.0,0.1,0.2,0.3,0.4,0.5]}'
+      return 0
+    fi
+    echo "{}"
+    return 0
+  fi
   curl -fsS -X POST "http://${HOST}:${PORT}${endpoint}" \
        -H "Content-Type: application/json" -d "${json}"
 }
+
+# Parse CLI args (simple)
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --host) HOST="$2"; shift 2;;
+    --port) PORT="$2"; shift 2;;
+    --rid) RID="$2"; shift 2;;
+    --save-dir) SAVE_DIR="$2"; shift 2;;
+    --force) FORCE="true"; shift 1;;
+    --dry-run) DRY_RUN="true"; shift 1;;
+    --simulate) SIMULATE="true"; shift 1;;
+    --poll-interval) POLL_INTERVAL="$2"; shift 2;;
+    -h|--help) usage;;
+    *) err "Unknown arg: $1"; usage;;
+  esac
+done
+
+log "HOST=$HOST PORT=$PORT RID=$RID SAVE_DIR=$SAVE_DIR DRY_RUN=$DRY_RUN SIMULATE=$SIMULATE POLL_INTERVAL=$POLL_INTERVAL FORCE=$FORCE"
 
 # 0) Inicializar el robot (posición segura de partida)
 /bin/echo
@@ -60,9 +147,14 @@ post_json "/torque/toggle?robot_id=${RID}" '{"torque_status": false}' | jq -r '.
 info "Iniciando calibración… (sujeta el brazo: el torque está OFF)"
 resp="$(post_nobody "/calibrate?robot_id=${RID}")"
 if ! check_bad_response "$resp"; then
-  err "Respuesta con valores no numéricos durante calibración. Aborting."
-  err "$resp"
-  exit 1
+  err "Respuesta con valores no numéricos durante calibración."
+  save_bad_json "$resp" calibrate_response
+  if [ "$FORCE" != "true" ]; then
+    err "Aborting (use --force to continue despite bad JSON)."
+    exit 1
+  else
+    log "--force enabled: continuing despite bad JSON"
+  fi
 fi
 status="$(jq -r '.calibration_status // "error"' <<<"$resp")"
 total="$(safe_jq "$resp" '.total_nb_steps // 0' 0)"
@@ -75,9 +167,14 @@ while [ "$status" = "in_progress" ]; do
   sleep 2
   resp="$(post_nobody "/calibrate?robot_id=${RID}")"
   if ! check_bad_response "$resp"; then
-    err "Respuesta con valores no numéricos durante calibración (polling). Aborting."
-    err "$resp"
-    exit 1
+    err "Respuesta con valores no numéricos durante calibración (polling)."
+    save_bad_json "$resp" calibrate_polling
+    if [ "$FORCE" != "true" ]; then
+      err "Aborting (use --force to continue despite bad JSON)."
+      exit 1
+    else
+      log "--force enabled: continuing despite bad JSON"
+    fi
   fi
   status="$(jq -r '.calibration_status // "error"' <<<"$resp")"
   step="$(safe_jq "$resp" '.current_step // 0' 0)"
@@ -95,11 +192,17 @@ info "Calibración COMPLETADA."
 info "Verificando joints leídos desde hardware (no debe contener NaN)…"
 joints_resp="$(post_json "/joints/read?robot_id=${RID}" '{"unit":"rad","source":"robot"}')"
 if ! check_bad_response "$joints_resp"; then
-  err "Lectura de joints contiene valores no válidos (NaN/null). No se activará torque."
-  err "$joints_resp"
-  exit 1
+  err "Lectura de joints contiene valores no válidos (NaN/null)."
+  save_bad_json "$joints_resp" joints_read
+  if [ "$FORCE" != "true" ]; then
+    err "No se activará torque. Aborting (use --force to override)."
+    exit 1
+  else
+    log "--force enabled: continuing despite invalid joints read"
+  fi
+else
+  info "Lectura de joints OK (sin NaN)."
 fi
-info "Lectura de joints OK (sin NaN)."
 
 # Doc: /calibrate (status: in_progress|success|error)  [oai_citation:3‡docs.phospho.ai](https://docs.phospho.ai/control/calibration-sequence)
 
