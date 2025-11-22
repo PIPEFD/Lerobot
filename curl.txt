@@ -1,0 +1,8 @@
+HOST=localhost PORT=80 RID=0
+curl -sS -X POST "http://$HOST:$PORT/joints/read?robot_id=$RID" \
+  -H "Content-Type: application/json" \
+  -d '{"unit":"rad","source":"robot"}' | jq
+
+curl -sS -X POST "http://$HOST:$PORT/move/init?robot_id=$RID" | jq
+curl -sS -X POST "http://$HOST:$PORT/torque/toggle?robot_id=$RID" \
+  -H "Content-Type: application/json" -d '{"torque_status": false}' | jq
